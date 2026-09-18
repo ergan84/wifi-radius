@@ -1,0 +1,18 @@
+# Secrets — never commit these
+.env
+*.env
+eapol-test.conf
+evrika-wifi.mobileconfig
+
+# Private keys and certificates
+certs/
+*.key
+Certificate.crt
+wifi-evrika-fullchain.crt
+
+# Runtime / local artifacts
+__pycache__/
+*.pyc
+nohup.out
+radius-lab.log
+*.log

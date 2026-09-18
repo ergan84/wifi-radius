@@ -1,0 +1,29 @@
+[Unit]
+Description=Custom PEAP-MSCHAPv2 RADIUS server
+After=network-online.target winbind.service
+Wants=network-online.target
+Requires=winbind.service
+
+[Service]
+Type=simple
+User=custom-radius
+Group=custom-radius
+SupplementaryGroups=winbindd_priv
+WorkingDirectory=/opt/custom-radius
+Environment=RADIUS_ENV=/etc/custom-radius/radius.env
+ExecStart=/usr/bin/python3 /opt/custom-radius/custom_radius.py
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
