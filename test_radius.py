@@ -8,6 +8,7 @@ network and needs no Active Directory. Run with:
 """
 import hashlib
 import hmac
+import sqlite3
 import struct
 import tempfile
 import textwrap
@@ -253,6 +254,75 @@ class PeapPhaseTwo(unittest.TestCase):
         inner = client.recv(65535)
         # PEAPv0 strips the 4-byte EAP header: type byte then payload.
         self.assertEqual(inner[0], cr.EAP_IDENTITY)
+
+
+class StateDatabase(unittest.TestCase):
+    """RADIUS_STATE_DB is optional and best-effort: a hiccup here must
+    never break authentication, and the admin panel must fall back to
+    parsing the journal when the DB is absent or unreadable."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        cert, key = make_cert(self.tmp.name)
+        self.db_path = str(Path(self.tmp.name) / "state.db")
+        self.server = cr.RadiusServer({
+            "RADIUS_SHARED_SECRET": "x",
+            "RADIUS_TLS_CERT_FILE": str(cert),
+            "RADIUS_TLS_KEY_FILE": str(key),
+            "AD_NETBIOS_DOMAIN": "T",
+            "RADIUS_STATE_DB": self.db_path,
+        })
+
+    def test_without_state_db_configured_server_still_starts(self):
+        cert, key = make_cert(self.tmp.name)
+        server = cr.RadiusServer({
+            "RADIUS_SHARED_SECRET": "x",
+            "RADIUS_TLS_CERT_FILE": str(cert),
+            "RADIUS_TLS_KEY_FILE": str(key),
+            "AD_NETBIOS_DOMAIN": "T",
+        })
+        self.assertIsNone(server.db)
+        server.record_login("ivan", "-", True, "Access-Accept")  # must not raise
+
+    def test_record_login_writes_a_row(self):
+        self.server.record_login("ivan", "AA:BB:CC:DD:EE:01", True, "Access-Accept")
+        rows = self.server.db.execute(
+            "SELECT user, mac, ok, detail FROM logins").fetchall()
+        self.assertEqual(rows, [("ivan", "AA:BB:CC:DD:EE:01", 1, "Access-Accept")])
+
+    def test_second_connection_sees_writes_from_the_first(self):
+        # Simulates admin_web.py, a separate process, reading the file
+        # custom_radius.py just wrote to - this is what WAL mode is for.
+        self.server.record_login("ivan", "-", False, "AD rejected")
+        reader = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        count = reader.execute("SELECT COUNT(*) FROM logins").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_admin_panel_reads_the_same_rows_the_server_wrote(self):
+        self.server.record_login("arman.b", "AA:BB:CC:DD:EE:01", True, "Access-Accept")
+        self.server.record_login("arman.b", "AA:BB:CC:DD:EE:02", False, "AD rejected")
+        events = admin_web.query_events_from_db(self.db_path)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["user"], "arman.b")
+        devices = admin_web.device_stats(events)
+        self.assertEqual(len(devices), 2)
+
+    def test_missing_db_file_falls_back_to_none(self):
+        events = admin_web.query_events_from_db("/no/such/path.db")
+        self.assertIsNone(events, "render_page must fall back to the journal on this")
+
+    def test_prune_removes_rows_past_retention(self):
+        self.server.db.execute(
+            "INSERT INTO logins (ts, user, mac, ok, detail) VALUES (?,?,?,?,?)",
+            ("2000-01-01T00:00:00+0000", "old", "-", 1, "Access-Accept"))
+        self.server.db.commit()
+        self.server.db_retention_days = 90
+        self.server.last_prune = 0.0  # force the throttle to allow this run
+        self.server.prune_state_db()
+        remaining = self.server.db.execute(
+            "SELECT COUNT(*) FROM logins WHERE user='old'").fetchone()[0]
+        self.assertEqual(remaining, 0)
 
 
 class MschapUsernameHygiene(unittest.TestCase):

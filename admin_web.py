@@ -9,6 +9,7 @@ import html
 import re
 import secrets
 import shlex
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -54,6 +55,7 @@ SAFE_CONFIG_KEYS = [
     "RADIUS_DUPLICATE_WINDOW_SECONDS",
     "RADIUS_REQUEST_TIMEOUT_SECONDS",
     "RADIUS_WORKER_THREADS",
+    "RADIUS_STATE_DB",
     "AD_NETBIOS_DOMAIN",
     "AD_ALLOWED_GROUP",
     "WIFI_SSID",
@@ -105,6 +107,35 @@ AD_REJECT_RE = re.compile(
     r"AD authentication or group policy rejected: user=(\S*)(?:\s+mac=(\S*))?")
 CLIENT_REJECT_RE = re.compile(r"request from (\S+) rejected: (.+)$")
 TIMEOUT_RE = re.compile(r"ntlm_auth timed out")
+
+
+def query_events_from_db(db_path, limit=5000):
+    """Read login history from the state database custom_radius.py
+    writes to, when RADIUS_STATE_DB is configured. This is not subject
+    to journald's rolling retention or the last-1000-lines cutoff the
+    journal fallback below has, and sidesteps regex parsing of log text
+    entirely - the event shape is the same either way, so device_stats()
+    and the renderers below don't need to know which source they got.
+
+    mode=ro: the panel only ever reads this file; custom_radius.py is
+    the sole writer, in WAL mode, so this is safe to do concurrently
+    from a separate process without locking it out.
+    """
+    try:
+        uri = f"file:{db_path}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT ts, user, mac, ok, detail FROM logins "
+                "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    events = [{"ts": ts, "user": user, "mac": mac, "ok": bool(ok),
+              "detail": detail} for ts, user, mac, ok, detail in rows]
+    events.reverse()  # oldest first, matching parse_events()'s journal order
+    return events
 
 
 def parse_events(journal_text):
@@ -348,20 +379,6 @@ PAGE = """<!doctype html>
   </div>
 </section>
 
-<section>
-  <div class="section-head">
-    <p class="section-title">Попытки входа — последние сверху</p>
-  </div>
-  <div class="panel scroll">
-  <table>
-  <thead><tr><th>Время</th><th>Пользователь</th><th>MAC</th><th>Результат</th></tr></thead>
-  <tbody>
-  {event_rows}
-  </tbody>
-  </table>
-  </div>
-</section>
-
 </main>
 </body>
 </html>
@@ -391,30 +408,15 @@ def render_device_rows(devices):
     return "\n".join(rows)
 
 
-def render_event_rows(events):
-    if not events:
-        return '<tr class="empty"><td colspan="4">пока нет попыток входа</td></tr>'
-    rows = []
-    for event in reversed(events[-200:]):
-        badge_class = "badge-ok" if event["ok"] else "badge-bad"
-        badge_text = "ACCEPT" if event["ok"] else "REJECT"
-        rows.append(
-            "<tr>"
-            f'<td>{html.escape(event["ts"])}</td>'
-            f'<td>{html.escape(event["user"])}</td>'
-            f'<td class="mono">{html.escape(event["mac"])}</td>'
-            f'<td><span class="badge {badge_class}">{badge_text}</span> '
-            f'{html.escape(event["detail"])}</td>'
-            "</tr>"
-        )
-    return "\n".join(rows)
-
-
 def render_page(cfg):
     state, _detail = service_status()
     state_class = "ok" if state == "active" else "bad"
-    journal = recent_journal()
-    events = parse_events(journal)
+    events = None
+    db_path = cfg.get("RADIUS_STATE_DB", "")
+    if db_path:
+        events = query_events_from_db(db_path)
+    if events is None:
+        events = parse_events(recent_journal())
     accepted = sum(1 for e in events if e["ok"])
     rejected = sum(1 for e in events if not e["ok"])
     rej_class = "warn" if rejected else "ok"
@@ -433,7 +435,6 @@ def render_page(cfg):
         rej_class=rej_class,
         config_rows="\n".join(rows),
         device_rows=render_device_rows(devices),
-        event_rows=render_event_rows(events),
     )
 
 

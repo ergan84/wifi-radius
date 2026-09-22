@@ -16,6 +16,10 @@ Restart=on-failure
 RestartSec=2s
 NoNewPrivileges=true
 PrivateTmp=true
+# Auto-creates /var/lib/custom-radius (owned by User=/Group= above) and
+# makes it writable under ProtectSystem=strict below, for the optional
+# login-history SQLite database (RADIUS_STATE_DB).
+StateDirectory=custom-radius
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true

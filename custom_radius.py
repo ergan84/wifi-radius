@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -211,6 +212,43 @@ def normalize_username(raw):
     return text.split("@", 1)[0].lower()
 
 
+def open_state_db(path):
+    """Open (creating if needed) the SQLite file that records login
+    history, so the admin panel is not limited to whatever the last
+    1000 lines of journald happen to still hold. Optional: returns None
+    if `path` is empty or the file cannot be opened, and the server
+    keeps running on journal logging alone - this is durability, not a
+    dependency the RADIUS protocol path should ever block on.
+
+    WAL mode lets custom_radius.py (writer) and admin_web.py (reader,
+    a separate process) use the file concurrently without locking each
+    other out.
+    """
+    if not path:
+        return None
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path, check_same_thread=False, timeout=5)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS logins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                user TEXT NOT NULL,
+                mac TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                detail TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_logins_ts ON logins(ts)")
+        conn.commit()
+        return conn
+    except sqlite3.Error as exc:
+        logging.warning("state db %s unavailable, falling back to journal "
+                        "logging only: %s", path, exc)
+        return None
+
+
 def normalize_mac(raw):
     """Calling-Station-Id formats differ by vendor ("aabbccddeeff",
     "AA-BB-CC-DD-EE-FF", "aa:bb:cc:dd:ee:ff", ...). Normalize to
@@ -286,6 +324,10 @@ class RadiusServer:
         self.ntlm_timeout = int(config.get("RADIUS_REQUEST_TIMEOUT_SECONDS", "5"))
         self.workers = int(config.get("RADIUS_WORKER_THREADS", "16"))
         self.allowed_clients = parse_allowed_clients(config.get("RADIUS_CLIENT_IP", "*"))
+        self.db = open_state_db(config.get("RADIUS_STATE_DB", ""))
+        self.db_lock = threading.Lock()
+        self.db_retention_days = int(config.get("RADIUS_STATE_DB_RETENTION_DAYS", "90"))
+        self.last_prune = 0.0
         self.context = SSL.Context(SSL.TLS_SERVER_METHOD)
         # use_certificate_chain_file (not use_certificate_file) so any
         # intermediate CA certificates after the leaf in the PEM file are
@@ -318,6 +360,7 @@ class RadiusServer:
             self.sessions.pop(token, None)
 
     def cleanup(self):
+        self.prune_state_db()
         now = time.monotonic()
         with self.lock:
             for token, session in list(self.sessions.items()):
@@ -326,6 +369,42 @@ class RadiusServer:
             for key, (created, _) in list(self.responses.items()):
                 if now - created > self.duplicate_window:
                     del self.responses[key]
+
+    def record_login(self, user, mac, ok, detail):
+        """Best-effort: a login must never fail or block because the
+        history database had a hiccup."""
+        if self.db is None:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        try:
+            with self.db_lock:
+                self.db.execute(
+                    "INSERT INTO logins (ts, user, mac, ok, detail) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (ts, user or "-", mac or "-", int(bool(ok)), detail))
+                self.db.commit()
+        except sqlite3.Error as exc:
+            logging.warning("failed to record login in state db: %s", exc)
+
+    def prune_state_db(self):
+        """Delete rows older than the retention window. Runs at most
+        once every 6 hours - the DELETE is indexed and cheap, but there
+        is no reason to run it on every single packet."""
+        if self.db is None:
+            return
+        now = time.monotonic()
+        if now - self.last_prune < 6 * 3600:
+            return
+        self.last_prune = now
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%S%z",
+            time.localtime(time.time() - self.db_retention_days * 86400))
+        try:
+            with self.db_lock:
+                self.db.execute("DELETE FROM logins WHERE ts < ?", (cutoff,))
+                self.db.commit()
+        except sqlite3.Error as exc:
+            logging.warning("failed to prune state db: %s", exc)
 
     def attributes(self, attrs, kind):
         return [value for attr_kind, value, _ in attrs if attr_kind == kind]
@@ -360,6 +439,8 @@ class RadiusServer:
         self.drop_session(session.token)
         logging.info("access accepted user=%s mac=%s",
                      session.username, session.calling_station or "-")
+        self.record_login(session.username, session.calling_station,
+                          True, "Access-Accept")
         return radius_response(ACCESS_ACCEPT, radius_id, request_auth,
                                attrs, self.secret)
 
@@ -472,6 +553,8 @@ class RadiusServer:
                 logging.warning(
                     "AD authentication or group policy rejected: user=%s mac=%s",
                     session.username, session.calling_station or "-")
+                self.record_login(session.username, session.calling_station,
+                                  False, "AD отклонил (пароль/группа)")
                 raise PermissionError("AD rejected credentials")
             response = authenticator_response(
                 nt_key, nt_response, peer_challenge,
@@ -719,6 +802,7 @@ class RadiusServer:
                 sock.sendto(response, peer)
         except Exception as exc:
             logging.warning("request from %s rejected: %s", peer[0], exc)
+            self.record_login(peer[0], "-", False, str(exc))
 
 
 def main():
