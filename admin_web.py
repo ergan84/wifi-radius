@@ -94,11 +94,15 @@ def recent_journal(lines=1000):
                 "-o", "short-iso"], timeout=10)
 
 
-# The trailing " mac=..." group is optional so journal lines written before
+# The trailing "mac=..." group is optional so journal lines written before
 # Calling-Station-Id tracking was added still parse (just without a MAC).
-ACCEPT_RE = re.compile(r"access accepted user=(\S*)(?: mac=(\S*))?")
+# \s+ rather than a literal single space: a client whose MSCHAPv2 name had
+# trailing padding produced "user=x  mac=y" (two spaces) in a handful of
+# lines logged before the padding was stripped server-side - a fixed single
+# space would have missed those retroactively.
+ACCEPT_RE = re.compile(r"access accepted user=(\S*)(?:\s+mac=(\S*))?")
 AD_REJECT_RE = re.compile(
-    r"AD authentication or group policy rejected: user=(\S*)(?: mac=(\S*))?")
+    r"AD authentication or group policy rejected: user=(\S*)(?:\s+mac=(\S*))?")
 CLIENT_REJECT_RE = re.compile(r"request from (\S+) rejected: (.+)$")
 TIMEOUT_RE = re.compile(r"ntlm_auth timed out")
 

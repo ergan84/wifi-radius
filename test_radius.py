@@ -348,6 +348,14 @@ class AdminPanel(unittest.TestCase):
         self.assertEqual(events[2]["user"], "10.0.0.9")
         self.assertEqual(events[2]["mac"], "-", "no MAC available for a pre-EAP rejection")
 
+    def test_double_space_before_mac_still_parses(self):
+        # A handful of real production lines had "user=x  mac=y" (two
+        # spaces) from before the MSCHAPv2 username-padding fix landed.
+        journal = ("2026-09-22T05:08:24+0000 h p[1]: INFO access accepted "
+                  "user=ivan@example.com  mac=B2:F6:A2:FB:C8:03\n")
+        events = admin_web.parse_events(journal)
+        self.assertEqual(events[0]["mac"], "B2:F6:A2:FB:C8:03")
+
     def test_old_journal_lines_without_mac_still_parse(self):
         # Lines written before Calling-Station-Id tracking was added must
         # not start throwing or silently dropping events after an upgrade.
