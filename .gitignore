@@ -2,17 +2,19 @@
 .env
 *.env
 eapol-test.conf
-evrika-wifi.mobileconfig
+
+# Generated client profiles (contain site names and the CA certificate)
+*.mobileconfig
 
 # Private keys and certificates
 certs/
 *.key
-Certificate.crt
-wifi-evrika-fullchain.crt
+*.crt
+*.csr
+*.pem
 
 # Runtime / local artifacts
 __pycache__/
 *.pyc
 nohup.out
-radius-lab.log
 *.log

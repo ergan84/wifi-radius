@@ -4,15 +4,22 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import socket
 import struct
 import subprocess
+import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from OpenSSL import SSL
+
+
+DEFAULT_ENV_PATH = "/etc/custom-radius/radius.env"
 
 
 ACCESS_REQUEST = 1
@@ -20,6 +27,7 @@ ACCESS_ACCEPT = 2
 ACCESS_REJECT = 3
 ACCESS_CHALLENGE = 11
 ATTR_STATE = 24
+ATTR_CALLING_STATION_ID = 31
 ATTR_VENDOR_SPECIFIC = 26
 ATTR_EAP_MESSAGE = 79
 ATTR_MESSAGE_AUTHENTICATOR = 80
@@ -56,7 +64,7 @@ def load_env(path):
 
 def parse_allowed_clients(value):
     """RADIUS_CLIENT_IP: "*" allows any source, otherwise a comma-separated
-    list of IPs and/or CIDR networks, e.g. "192.168.18.225,10.10.1.0/24".
+    list of IPs and/or CIDR networks, e.g. "192.0.2.10,198.51.100.0/24".
     Returns None for "allow all", else a list of ip_network objects.
     """
     value = (value or "*").strip()
@@ -203,6 +211,18 @@ def normalize_username(raw):
     return text.split("@", 1)[0].lower()
 
 
+def normalize_mac(raw):
+    """Calling-Station-Id formats differ by vendor ("aabbccddeeff",
+    "AA-BB-CC-DD-EE-FF", "aa:bb:cc:dd:ee:ff", ...). Normalize to
+    AA:BB:CC:DD:EE:FF so the same device is not counted twice under two
+    spellings. Returns "" for anything that is not 12 hex digits."""
+    hex_only = re.sub(r"[^0-9a-fA-F]", "", raw)
+    if len(hex_only) != 12:
+        return ""
+    hex_only = hex_only.upper()
+    return ":".join(hex_only[i:i + 2] for i in range(0, 12, 2))
+
+
 def challenge_hash(peer_challenge, auth_challenge, username):
     return hashlib.sha1(peer_challenge + auth_challenge + username).digest()[:8]
 
@@ -220,6 +240,10 @@ def authenticator_response(password_hash_hash, nt_response, peer_challenge,
 class Session:
     token: bytes
     tls: SSL.Connection
+    # Serializes work on this session. The TLS connection and the phase
+    # machine below are not thread safe, and an access point retransmits
+    # while the server is still busy with the previous packet.
+    lock: threading.Lock = field(default_factory=threading.Lock)
     created: float = field(default_factory=time.monotonic)
     outer_id: int = 0
     inner_id: int = 0
@@ -232,6 +256,10 @@ class Session:
     auth_challenge: bytes | None = None
     accept_ready: bool = False
     username: str = ""
+    # Calling-Station-Id (RFC 2865 5.31), normally the client's MAC as sent
+    # by the access point. Refreshed from every request that carries it,
+    # since some APs only include it on the outer identity request.
+    calling_station: str = ""
 
     def next_outer_id(self):
         self.outer_id = (self.outer_id + 1) & 0xff
@@ -250,9 +278,13 @@ class RadiusServer:
             raise ValueError("RADIUS_SHARED_SECRET is empty")
         self.sessions = {}
         self.responses = {}
+        # Guards the two dictionaries above only. It is never held across
+        # ntlm_auth, so a slow domain controller cannot stall other users.
+        self.lock = threading.Lock()
         self.ttl = int(config.get("RADIUS_SESSION_TTL_SECONDS", "120"))
         self.duplicate_window = int(config.get("RADIUS_DUPLICATE_WINDOW_SECONDS", "30"))
         self.ntlm_timeout = int(config.get("RADIUS_REQUEST_TIMEOUT_SECONDS", "5"))
+        self.workers = int(config.get("RADIUS_WORKER_THREADS", "16"))
         self.allowed_clients = parse_allowed_clients(config.get("RADIUS_CLIENT_IP", "*"))
         self.context = SSL.Context(SSL.TLS_SERVER_METHOD)
         # use_certificate_chain_file (not use_certificate_file) so any
@@ -262,6 +294,11 @@ class RadiusServer:
         self.context.use_certificate_chain_file(config["RADIUS_TLS_CERT_FILE"])
         self.context.use_privatekey_file(config["RADIUS_TLS_KEY_FILE"])
         self.context.check_privatekey()
+        # Pinned to TLS 1.2 on purpose, not out of caution: PEAPv0 derives
+        # its MPPE keys from the TLS 1.2 PRF with the "client EAP
+        # encryption" label. TLS 1.3 changes key derivation and has no
+        # standardised PEAPv0 binding, so it is neither a min nor a max
+        # this server can be configured into.
         self.context.set_min_proto_version(SSL.TLS1_2_VERSION)
         self.context.set_max_proto_version(SSL.TLS1_2_VERSION)
         self.context.set_cipher_list(b"HIGH:!aNULL:!MD5:!RC4")
@@ -272,17 +309,23 @@ class RadiusServer:
         connection = SSL.Connection(self.context, None)
         connection.set_accept_state()
         session = Session(token=token, tls=connection, outer_id=response_id)
-        self.sessions[token] = session
+        with self.lock:
+            self.sessions[token] = session
         return session
+
+    def drop_session(self, token):
+        with self.lock:
+            self.sessions.pop(token, None)
 
     def cleanup(self):
         now = time.monotonic()
-        for token, session in list(self.sessions.items()):
-            if now - session.created > self.ttl:
-                del self.sessions[token]
-        for key, (created, _) in list(self.responses.items()):
-            if now - created > self.duplicate_window:
-                del self.responses[key]
+        with self.lock:
+            for token, session in list(self.sessions.items()):
+                if now - session.created > self.ttl:
+                    del self.sessions[token]
+            for key, (created, _) in list(self.responses.items()):
+                if now - created > self.duplicate_window:
+                    del self.responses[key]
 
     def attributes(self, attrs, kind):
         return [value for attr_kind, value, _ in attrs if attr_kind == kind]
@@ -297,21 +340,26 @@ class RadiusServer:
         return radius_response(ACCESS_REJECT, radius_id, request_auth,
                                [(ATTR_EAP_MESSAGE, eap)], self.secret)
 
-    def accept(self, radius_id, request_auth, session):
+    def accept(self, radius_id, request_auth, session, eap_id):
         key_material = session.tls.export_keying_material(
             b"client EAP encryption", 64, None
         )
         recv_key, send_key = key_material[:32], key_material[32:64]
         attrs = [
+            # Echo the identifier of the response we are acknowledging
+            # rather than our own counter; they agree today, but a
+            # supplicant that drops an EAP-Success with a mismatched
+            # identifier is within its rights.
             (ATTR_EAP_MESSAGE,
-             eap_packet(EAP_SUCCESS, session.outer_id)),
+             eap_packet(EAP_SUCCESS, eap_id)),
             (ATTR_VENDOR_SPECIFIC, microsoft_vsa(
                 17, encrypt_mppe_key(recv_key, self.secret, request_auth))),
             (ATTR_VENDOR_SPECIFIC, microsoft_vsa(
                 16, encrypt_mppe_key(send_key, self.secret, request_auth))),
         ]
-        self.sessions.pop(session.token, None)
-        logging.info("access accepted user=%s", session.username)
+        self.drop_session(session.token)
+        logging.info("access accepted user=%s mac=%s",
+                     session.username, session.calling_station or "-")
         return radius_response(ACCESS_ACCEPT, radius_id, request_auth,
                                attrs, self.secret)
 
@@ -413,13 +461,17 @@ class RadiusServer:
             nt_response = value[24:48]
             username = data[54:mschap_length]
             clean_username = strip_domain(username)
-            session.username = username.decode("utf-8", "replace")
+            # Some clients pad the MSCHAPv2 Name field; RFC 2759 does
+            # not require it to be exact, so strip before it ends up in
+            # logs or the admin panel's device table as a distinct row.
+            session.username = username.decode("utf-8", "replace").strip()
             challenge = challenge_hash(peer_challenge,
                                        session.auth_challenge, clean_username)
             ok, nt_key = self.ntlm_auth(username, challenge, nt_response)
             if not ok:
-                logging.warning("AD authentication or group policy rejected: user=%s",
-                                session.username)
+                logging.warning(
+                    "AD authentication or group policy rejected: user=%s mac=%s",
+                    session.username, session.calling_station or "-")
                 raise PermissionError("AD rejected credentials")
             response = authenticator_response(
                 nt_key, nt_response, peer_challenge,
@@ -449,20 +501,38 @@ class RadiusServer:
         raise ValueError("unexpected inner state")
 
     def process_tls(self, session, tls_data):
-        logging.info("TLS input phase=%s bytes=%d", session.phase, len(tls_data))
+        logging.debug("TLS input phase=%s bytes=%d", session.phase, len(tls_data))
         if tls_data:
             session.tls.bio_write(tls_data)
         if session.phase == "tls":
             try:
                 session.tls.do_handshake()
-                session.phase = "identity"
-                inner_id = session.next_inner_id()
-                self.queue_inner(session, eap_packet(
-                    EAP_REQUEST, inner_id, EAP_IDENTITY, b""
-                ))
+                # Flush ChangeCipherSpec+Finished on its own and start
+                # phase 2 only once the client has acknowledged it.
+                #
+                # Piggybacking the tunnelled EAP-Identity request onto the
+                # same TLS flight deadlocks iOS: it processes the
+                # handshake, discards the trailing application data, sends
+                # the empty PEAP ACK the RFC prescribes and waits for phase
+                # 2 to begin - while the server, having already flushed the
+                # Identity request, has nothing left to send and ACKs back.
+                # Both sides then wait until the supplicant times out.
+                # Android happens to tolerate the piggyback, which is why
+                # it authenticated while iOS never got past the handshake.
+                session.phase = "start_phase2"
             except (SSL.WantReadError, SSL.WantWriteError):
                 pass
             self.tls_output(session)
+            return
+
+        if session.phase == "start_phase2":
+            session.phase = "identity"
+            inner_id = session.next_inner_id()
+            self.queue_inner(session, eap_packet(
+                EAP_REQUEST, inner_id, EAP_IDENTITY, b""
+            ))
+            self.tls_output(session)
+            logging.debug("phase 2 started, output bytes=%d", len(session.tls_out))
             return
 
         while True:
@@ -470,14 +540,14 @@ class RadiusServer:
                 clear = session.tls.recv(65535)
                 if not clear:
                     break
-                logging.info("TLS decrypted bytes=%d", len(clear))
+                logging.debug("TLS decrypted bytes=%d", len(clear))
                 if (len(clear) < 4 or clear[0] not in
                         (EAP_REQUEST, EAP_RESPONSE, EAP_SUCCESS, EAP_FAILURE) or
                         struct.unpack("!H", clear[2:4])[0] != len(clear)):
                     packet = eap_packet(EAP_RESPONSE, session.inner_id,
                                         clear[0], clear[1:])
-                    logging.info("headerless PEAPv0 inner response type=%d",
-                                 clear[0])
+                    logging.debug("headerless PEAPv0 inner response type=%d",
+                                  clear[0])
                     reply = self.handle_inner(session, packet)
                     if reply is not None:
                         self.queue_inner(session, reply[4:])
@@ -493,12 +563,12 @@ class RadiusServer:
                 break
             packet = bytes(session.inner_in[:inner_length])
             del session.inner_in[:inner_length]
-            logging.info("inner EAP phase=%s bytes=%d", session.phase, len(packet))
+            logging.debug("inner EAP phase=%s bytes=%d", session.phase, len(packet))
             reply = self.handle_inner(session, packet)
             if reply is not None:
                 self.queue_inner(session, reply[4:])
         self.tls_output(session)
-        logging.info("TLS output bytes=%d phase=%s", len(session.tls_out), session.phase)
+        logging.debug("TLS output bytes=%d phase=%s", len(session.tls_out), session.phase)
 
     def handle_peap(self, radius_id, request_auth, session, outer_id, data):
         if not data:
@@ -538,19 +608,37 @@ class RadiusServer:
                              EAP_PEAP, outgoing)
             return self.challenge(radius_id, request_auth, session, eap)
         if session.accept_ready:
-            return self.accept(radius_id, request_auth, session)
+            return self.accept(radius_id, request_auth, session, outer_id)
         ack = eap_packet(EAP_REQUEST, session.next_outer_id(),
                          EAP_PEAP, b"\x00")
         return self.challenge(radius_id, request_auth, session, ack)
 
-    def handle(self, packet, source_ip):
+    def handle(self, packet, peer):
         code, radius_id, request_auth, attrs = parse_radius(packet)
         if code != ACCESS_REQUEST:
             raise ValueError("not an Access-Request")
-        if not client_allowed(source_ip, self.allowed_clients):
+        if not client_allowed(peer[0], self.allowed_clients):
             raise PermissionError("unknown RADIUS client")
         if not verify_message_authenticator(packet, attrs, self.secret):
             raise PermissionError("invalid Message-Authenticator")
+
+        # Duplicate suppression per RFC 5080 2.2.2, deliberately consulted
+        # only after the shared secret has been proven. Answering from the
+        # cache first would let anyone who can observe a request replay it
+        # and pull responses out of the server without knowing the secret.
+        cache_key = (peer, radius_id, request_auth)
+        with self.lock:
+            cached = self.responses.get(cache_key)
+        if cached is not None:
+            return cached[1]
+
+        response = self.build_response(radius_id, request_auth, attrs, peer)
+        if response is not None:
+            with self.lock:
+                self.responses[cache_key] = (time.monotonic(), response)
+        return response
+
+    def build_response(self, radius_id, request_auth, attrs, peer):
         eap_values = self.attributes(attrs, ATTR_EAP_MESSAGE)
         if not eap_values:
             raise ValueError("EAP-Message is missing")
@@ -559,54 +647,88 @@ class RadiusServer:
         if eap_code != EAP_RESPONSE:
             raise ValueError("expected EAP Response")
 
+        # The AP resends Calling-Station-Id (the client's MAC) on every
+        # Access-Request. Keep it refreshed on the session so the admin
+        # panel can show which device a login came from, not just which
+        # account - some APs only populate it on the outer identity
+        # request, others on every one.
+        calling_values = self.attributes(attrs, ATTR_CALLING_STATION_ID)
+        calling_station = (normalize_mac(
+            calling_values[0].decode("utf-8", "replace")) if calling_values
+            else "")
+
         state_values = self.attributes(attrs, ATTR_STATE)
         if not state_values:
             if eap_type != EAP_IDENTITY:
                 return self.reject(radius_id, request_auth, eap_id)
             session = self.new_session(eap_id)
+            session.calling_station = calling_station
             start = eap_packet(EAP_REQUEST, session.next_outer_id(),
                                EAP_PEAP, bytes((TLS_START,)))
             return self.challenge(radius_id, request_auth, session, start)
 
-        session = self.sessions.get(state_values[0])
+        with self.lock:
+            session = self.sessions.get(state_values[0])
         if session is None:
             return self.reject(radius_id, request_auth, eap_id)
+        if calling_station:
+            session.calling_station = calling_station
         if eap_type == EAP_NAK:
             return self.reject(radius_id, request_auth, eap_id)
         if eap_type != EAP_PEAP:
             raise ValueError("expected PEAP")
+
+        # One packet at a time per session. A retransmit that arrives while
+        # the previous one is still in ntlm_auth is dropped rather than
+        # queued: the access point will retransmit again, and by then the
+        # duplicate cache above usually has the answer.
+        if not session.lock.acquire(blocking=False):
+            logging.debug("session busy, dropping retransmit from %s", peer[0])
+            return None
         try:
             return self.handle_peap(radius_id, request_auth, session,
                                     eap_id, data)
         except PermissionError:
-            self.sessions.pop(session.token, None)
+            self.drop_session(session.token)
             return self.reject(radius_id, request_auth, eap_id)
+        finally:
+            session.lock.release()
 
     def serve(self):
         address = self.cfg.get("RADIUS_LISTEN_IP", "127.0.0.1")
         port = int(self.cfg.get("RADIUS_AUTH_PORT", "1812"))
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.bind((address, port))
-        logging.info("custom RADIUS listening on %s:%d", address, port)
-        while True:
-            packet, peer = sock.recvfrom(65535)
+        logging.info("custom RADIUS listening on %s:%d (%d worker threads)",
+                     address, port, self.workers)
+        # Requests are handled off the receive loop because ntlm_auth is a
+        # blocking subprocess call: on a single thread one slow winbind
+        # lookup stalled every other user's authentication for up to
+        # RADIUS_REQUEST_TIMEOUT_SECONDS.
+        with ThreadPoolExecutor(max_workers=self.workers,
+                                thread_name_prefix="radius") as pool:
+            while True:
+                packet, peer = sock.recvfrom(65535)
+                pool.submit(self.serve_one, sock, packet, peer)
+
+    def serve_one(self, sock, packet, peer):
+        try:
             self.cleanup()
-            cache_key = (peer, packet[1:2], packet[4:20])
-            cached = self.responses.get(cache_key)
-            if cached is not None:
-                sock.sendto(cached[1], peer)
-                continue
-            try:
-                response = self.handle(packet, peer[0])
-                self.responses[cache_key] = (time.monotonic(), response)
+            response = self.handle(packet, peer)
+            if response is not None:
                 sock.sendto(response, peer)
-            except Exception as exc:
-                logging.warning("request from %s rejected: %s", peer[0], exc)
+        except Exception as exc:
+            logging.warning("request from %s rejected: %s", peer[0], exc)
 
 
 def main():
-    env_path = os.environ.get("RADIUS_ENV", "/home/dev/radius-lab/.env")
-    config = load_env(env_path)
+    env_path = os.environ.get("RADIUS_ENV", DEFAULT_ENV_PATH)
+    try:
+        config = load_env(env_path)
+    except OSError as exc:
+        sys.exit(f"cannot read config {env_path}: {exc}\n"
+                 f"Set RADIUS_ENV=/path/to/radius.env or create "
+                 f"{DEFAULT_ENV_PATH} from .env.example.")
     logging.basicConfig(
         level=getattr(logging, config.get("RADIUS_LOG_LEVEL", "INFO").upper()),
         format="%(asctime)s %(levelname)s %(message)s",
