@@ -25,7 +25,17 @@ ProtectHome=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET
+# All three are required by ntlm_auth, which runs as a subprocess in
+# this same cgroup and inherits these restrictions:
+#   AF_UNIX    - the socket it uses to talk to winbindd. Without it,
+#                ntlm_auth cannot reach winbindd at all and dies with
+#                "could not obtain winbind separator" and a SIGSEGV /
+#                SIGABRT, which surfaces here as every login rejected.
+#   AF_NETLINK - getifaddrs() opens a netlink socket to enumerate
+#                interfaces; without it Samba reports "Could not
+#                determine network interfaces".
+#   AF_INET    - the RADIUS listener itself.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
 LockPersonality=true
 MemoryDenyWriteExecute=true
 

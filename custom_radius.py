@@ -500,7 +500,12 @@ class RadiusServer:
             command.append("--require-membership-of=" +
                            self.cfg["AD_NETBIOS_DOMAIN"] + "\\" + group)
         try:
+            # errors="replace": winbind/Samba can emit a locale-encoded
+            # (non-UTF-8) diagnostic, and text=True would otherwise decode
+            # it strictly and raise UnicodeDecodeError right here - killing
+            # the request mid-session rather than just failing the login.
             result = subprocess.run(command, capture_output=True, text=True,
+                                    errors="replace",
                                     timeout=self.ntlm_timeout)
         except subprocess.TimeoutExpired:
             logging.warning("ntlm_auth timed out after %ds (AD/winbind unresponsive)",
@@ -774,6 +779,15 @@ class RadiusServer:
         except PermissionError:
             self.drop_session(session.token)
             return self.reject(radius_id, request_auth, eap_id)
+        except Exception:
+            # An unexpected failure part-way through means the TLS
+            # connection has already consumed this record. Replaying it on
+            # the access point's retransmit would desynchronise the TLS
+            # sequence numbers ("bad record mac", then "Unexpected EOF"),
+            # so the session is discarded and the client restarts cleanly
+            # instead of failing in a way that looks like a TLS bug.
+            self.drop_session(session.token)
+            raise
         finally:
             session.lock.release()
 

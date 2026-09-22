@@ -9,6 +9,7 @@ network and needs no Active Directory. Run with:
 import hashlib
 import hmac
 import sqlite3
+import subprocess
 import struct
 import tempfile
 import textwrap
@@ -254,6 +255,31 @@ class PeapPhaseTwo(unittest.TestCase):
         inner = client.recv(65535)
         # PEAPv0 strips the 4-byte EAP header: type byte then payload.
         self.assertEqual(inner[0], cr.EAP_IDENTITY)
+
+
+class NtlmAuthOutputDecoding(unittest.TestCase):
+    """winbind can emit a locale-encoded (non-UTF-8) diagnostic. Decoding
+    it strictly raised UnicodeDecodeError mid-session, which aborted the
+    request without a reply - the access point then retransmitted, the
+    same TLS record was fed in twice, and the session died with
+    "bad record mac". A bad login must fail as a bad login, not as a
+    TLS fault."""
+
+    def test_non_utf8_output_does_not_raise(self):
+        # The exact byte from the production log: 0xf4 at position 0.
+        cmd = ["python3", "-c",
+               "import sys; sys.stdout.buffer.write(b'\\xf4\\xee\\xf8')"]
+        with self.assertRaises(UnicodeDecodeError):
+            subprocess.run(cmd, capture_output=True, text=True)
+        # ...which is why the server passes errors="replace":
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                               errors="replace")
+        self.assertTrue(result.stdout)
+
+    def test_server_passes_errors_replace_to_subprocess(self):
+        source = Path(cr.__file__).read_text()
+        self.assertIn('errors="replace"', source,
+                      "ntlm_auth output must not be decoded strictly")
 
 
 class StateDatabase(unittest.TestCase):
