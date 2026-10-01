@@ -221,30 +221,30 @@ PAGE = """<!doctype html>
 <title>custom-radius admin</title>
 <style>
   :root {{
-    --bg: #0b0d11;
-    --surface: #14171d;
-    --surface-2: #1a1e26;
-    --border: #262b35;
-    --text: #e8e9ec;
-    --muted: #8b93a1;
-    --accent: #5b9df9;
-    --ok: #3ecf7e;
-    --ok-bg: rgba(62, 207, 126, 0.12);
-    --bad: #f0605a;
-    --bad-bg: rgba(240, 96, 90, 0.12);
-    --warn: #f2b84b;
-    --radius: 10px;
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --surface-2: #141414;
+    --border: #2a2a2a;
+    --text: #e5e7eb;
+    --muted: #6b7280;
+    --accent: #22d3ee;
+    --ok: #34d399;
+    --ok-bg: rgba(52, 211, 153, 0.12);
+    --bad: #f87171;
+    --bad-bg: rgba(248, 113, 113, 0.12);
+    --warn: #fbbf24;
+    --radius: 8px;
   }}
   * {{ box-sizing: border-box; }}
   body {{
-    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     background: var(--bg); color: var(--text);
     margin: 0; padding: 0 0 40px;
     -webkit-font-smoothing: antialiased;
   }}
   header {{
     position: sticky; top: 0; z-index: 10;
-    background: rgba(11, 13, 17, 0.92); backdrop-filter: blur(8px);
+    background: rgba(15, 15, 15, 0.92); backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
     padding: 16px 20px; display: flex; align-items: baseline;
     justify-content: space-between; flex-wrap: wrap; gap: 8px;
@@ -280,7 +280,7 @@ PAGE = """<!doctype html>
     font-size: 11px; color: var(--muted); text-transform: uppercase;
     letter-spacing: 0.05em; display: flex; align-items: center; gap: 6px;
   }}
-  .stat .value {{ font-size: 24px; font-weight: 600; margin-top: 6px; }}
+  .stat .value {{ font-size: 30px; font-weight: 300; font-variant-numeric: tabular-nums; margin-top: 6px; }}
   .dot {{ width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; display: inline-block; }}
   .dot.ok {{ background: var(--ok); box-shadow: 0 0 8px var(--ok); }}
   .dot.bad {{ background: var(--bad); box-shadow: 0 0 8px var(--bad); }}
@@ -446,26 +446,26 @@ EDIT_PAGE = """<!doctype html>
 <title>custom-radius admin — изменить конфигурацию</title>
 <style>
   :root {{
-    --bg: #0b0d11;
-    --surface: #14171d;
-    --surface-2: #1a1e26;
-    --border: #262b35;
-    --text: #e8e9ec;
-    --muted: #8b93a1;
-    --accent: #5b9df9;
-    --warn: #f2b84b;
-    --warn-bg: rgba(242, 184, 75, 0.1);
-    --radius: 10px;
+    --bg: #0f0f0f;
+    --surface: #1a1a1a;
+    --surface-2: #141414;
+    --border: #2a2a2a;
+    --text: #e5e7eb;
+    --muted: #6b7280;
+    --accent: #22d3ee;
+    --warn: #fbbf24;
+    --warn-bg: rgba(251, 191, 36, 0.1);
+    --radius: 8px;
   }}
   * {{ box-sizing: border-box; }}
   body {{
-    font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+    font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     background: var(--bg); color: var(--text);
     margin: 0; padding: 0 0 40px;
     -webkit-font-smoothing: antialiased;
   }}
   header {{
-    background: rgba(11, 13, 17, 0.92); border-bottom: 1px solid var(--border);
+    background: rgba(15, 15, 15, 0.92); border-bottom: 1px solid var(--border);
     padding: 16px 20px;
   }}
   h1 {{ font-size: 16px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }}
