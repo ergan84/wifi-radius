@@ -419,6 +419,44 @@ class CallingStationTracking(unittest.TestCase):
         self.server.build_response(2, bytes(16), attrs2, ("127.0.0.1", 1))
         self.assertEqual(session.calling_station, "AA:BB:CC:DD:EE:02")
 
+    def test_nak_is_logged_with_requested_types(self):
+        eap = cr.eap_packet(cr.EAP_RESPONSE, 1, cr.EAP_IDENTITY, b"anonymous")
+        attrs = [(cr.ATTR_EAP_MESSAGE, eap, 0),
+                 (cr.ATTR_CALLING_STATION_ID, b"AA-BB-CC-DD-EE-01", 0)]
+        self.server.build_response(1, bytes(16), attrs, ("127.0.0.1", 1))
+        session, = self.server.sessions.values()
+
+        eap2 = cr.eap_packet(cr.EAP_RESPONSE, 2, cr.EAP_NAK, bytes((21,)))
+        attrs2 = [(cr.ATTR_EAP_MESSAGE, eap2, 0),
+                  (cr.ATTR_STATE, session.token, 0)]
+        with self.assertLogs(level="WARNING") as logs:
+            response = self.server.build_response(2, bytes(16), attrs2,
+                                                  ("127.0.0.1", 1))
+        self.assertEqual(response[0], cr.ACCESS_REJECT)
+        self.assertIn("identity=anonymous", logs.output[0])
+        self.assertIn("wants types 21", logs.output[0])
+        self.assertEqual(self.server.sessions, {})
+
+    def test_challenge_identifiers_follow_outer_identifier(self):
+        """The challenge goes out header-compressed, so Windows rebuilds its
+        EAP Identifier from the outer packet and drops it if MS-CHAPv2-ID
+        disagrees ([MS-PEAP] 3.1.5.6)."""
+        session = self.server.new_session(1)
+        session.outer_id = 7
+        session.phase = "identity"
+        inner = cr.eap_packet(cr.EAP_RESPONSE, 1, cr.EAP_IDENTITY, b"anonymous")
+        out = self.server.handle_inner(session, inner)
+        self.assertEqual(out[1], 8)  # EAP Identifier = next outer Identifier
+        self.assertEqual(out[6], 8)  # MS-CHAPv2-ID
+
+    def test_only_eap_tlv_keeps_its_header_in_the_tunnel(self):
+        """Windows waits forever on a header-compressed Result TLV."""
+        tlv = cr.eap_packet(cr.EAP_REQUEST, 9, cr.EAP_TLV,
+                            struct.pack("!HHH", 0x8003, 2, 1))
+        self.assertEqual(cr.tunnelled(tlv), tlv)
+        mschap = cr.eap_packet(cr.EAP_REQUEST, 9, cr.EAP_MSCHAPV2, b"x")
+        self.assertEqual(cr.tunnelled(mschap), mschap[4:])
+
     def test_missing_attribute_leaves_mac_blank_not_crashing(self):
         eap = cr.eap_packet(cr.EAP_RESPONSE, 1, cr.EAP_IDENTITY, b"anonymous")
         attrs = [(cr.ATTR_EAP_MESSAGE, eap, 0)]  # no Calling-Station-Id at all

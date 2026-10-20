@@ -274,6 +274,14 @@ def authenticator_response(password_hash_hash, nt_response, peer_challenge,
     return hashlib.sha1(digest + challenge + magic2).hexdigest().upper()
 
 
+def tunnelled(packet):
+    """Inner EAP packet as sent inside the PEAPv0 tunnel: header-compressed
+    (Type and data only), except EAP-TLV, which keeps its full header."""
+    if len(packet) > 4 and packet[4] == EAP_TLV:
+        return packet
+    return packet[4:]
+
+
 @dataclass
 class Session:
     token: bytes
@@ -294,6 +302,9 @@ class Session:
     auth_challenge: bytes | None = None
     accept_ready: bool = False
     username: str = ""
+    # Outer (often anonymous) EAP identity, kept only so that a reject
+    # before phase 2 can still say who it was for.
+    outer_identity: str = ""
     # Calling-Station-Id (RFC 2865 5.31), normally the client's MAC as sent
     # by the access point. Refreshed from every request that carries it,
     # since some APs only include it on the outer identity request.
@@ -526,7 +537,14 @@ class RadiusServer:
             if code != EAP_RESPONSE or kind != EAP_IDENTITY:
                 raise ValueError("expected inner identity")
             session.auth_challenge = secrets.token_bytes(16)
-            inner_id = session.next_inner_id()
+            # PEAPv0 sends this request header-compressed, so the client
+            # rebuilds its EAP Identifier from the outer EAP packet that
+            # carries it ([MS-PEAP] 3.1.5.6). Use that same value for the
+            # inner Identifier and MS-CHAPv2-ID: Windows drops a challenge
+            # whose MS-CHAPv2-ID differs from the rebuilt Identifier and
+            # times out, while iOS and Android ignore the mismatch.
+            inner_id = (session.outer_id + 1) & 0xff
+            session.inner_id = inner_id
             name = self.cfg.get("RADIUS_SERVER_NAME", "radius").encode()
             mschap_length = 5 + 16 + len(name)
             payload = struct.pack("!BBHB", 1, inner_id, mschap_length, 16)
@@ -575,7 +593,13 @@ class RadiusServer:
                 raise ValueError("expected MSCHAPv2 success acknowledgement")
             session.phase = "result_tlv"
             result_tlv = struct.pack("!HHH", 0x8003, 2, 1)
-            return eap_packet(EAP_REQUEST, identifier, EAP_TLV, result_tlv)
+            # EAP-TLV is exempt from PEAPv0 header compression and goes out
+            # with its full header ([MS-PEAP] 3.1.5.6), so its Identifier
+            # is read as is - make it the outer Identifier that carries it.
+            # Windows waits forever on a headerless Result TLV; iOS and
+            # Android accept either form.
+            tlv_id = (session.outer_id + 1) & 0xff
+            return eap_packet(EAP_REQUEST, tlv_id, EAP_TLV, result_tlv)
 
         if session.phase == "result_tlv":
             if code != EAP_RESPONSE or kind != EAP_TLV or len(data) < 6:
@@ -638,7 +662,7 @@ class RadiusServer:
                                   clear[0])
                     reply = self.handle_inner(session, packet)
                     if reply is not None:
-                        self.queue_inner(session, reply[4:])
+                        self.queue_inner(session, tunnelled(reply))
                 else:
                     session.inner_in += clear
             except SSL.WantReadError:
@@ -654,7 +678,7 @@ class RadiusServer:
             logging.debug("inner EAP phase=%s bytes=%d", session.phase, len(packet))
             reply = self.handle_inner(session, packet)
             if reply is not None:
-                self.queue_inner(session, reply[4:])
+                self.queue_inner(session, tunnelled(reply))
         self.tls_output(session)
         logging.debug("TLS output bytes=%d phase=%s", len(session.tls_out), session.phase)
 
@@ -748,9 +772,12 @@ class RadiusServer:
         state_values = self.attributes(attrs, ATTR_STATE)
         if not state_values:
             if eap_type != EAP_IDENTITY:
+                logging.warning("request from %s rejected: EAP type %d "
+                                "without State", peer[0], eap_type)
                 return self.reject(radius_id, request_auth, eap_id)
             session = self.new_session(eap_id)
             session.calling_station = calling_station
+            session.outer_identity = data.decode("utf-8", "replace")
             start = eap_packet(EAP_REQUEST, session.next_outer_id(),
                                EAP_PEAP, bytes((TLS_START,)))
             return self.challenge(radius_id, request_auth, session, start)
@@ -758,10 +785,26 @@ class RadiusServer:
         with self.lock:
             session = self.sessions.get(state_values[0])
         if session is None:
+            # Usually the session outlived RADIUS_SESSION_TTL_SECONDS, or the
+            # server restarted mid-authentication.
+            logging.warning("request from %s rejected: unknown or expired "
+                            "State", peer[0])
             return self.reject(radius_id, request_auth, eap_id)
         if calling_station:
             session.calling_station = calling_station
         if eap_type == EAP_NAK:
+            # The supplicant refused PEAP; the payload lists the EAP types
+            # it would accept instead (RFC 3748 5.3.1). Without this line
+            # a misconfigured client looks exactly like no client at all.
+            wanted = ",".join(str(b) for b in data) or "none"
+            logging.warning("access rejected identity=%s mac=%s: client "
+                            "refused PEAP (EAP-NAK, wants types %s)",
+                            session.outer_identity or "-",
+                            session.calling_station or "-", wanted)
+            self.record_login(session.outer_identity or "-",
+                              session.calling_station,
+                              False, f"client refused PEAP, wants {wanted}")
+            self.drop_session(session.token)
             return self.reject(radius_id, request_auth, eap_id)
         if eap_type != EAP_PEAP:
             raise ValueError("expected PEAP")
