@@ -208,8 +208,9 @@ class PeapPhaseTwo(unittest.TestCase):
             "AD_NETBIOS_DOMAIN": "EXAMPLE",
         })
 
-    def handshake(self):
-        """Drive a real TLS handshake into a fresh session."""
+    def handshake(self, resume=None):
+        """Drive a real TLS handshake into a fresh session, optionally
+        resuming the TLS session of an earlier client connection."""
         session = self.server.new_session(1)
         context = SSL.Context(SSL.TLS_CLIENT_METHOD)
         context.set_verify(SSL.VERIFY_NONE, lambda *a: True)
@@ -217,6 +218,8 @@ class PeapPhaseTwo(unittest.TestCase):
         context.set_max_proto_version(SSL.TLS1_2_VERSION)
         client = SSL.Connection(context, None)
         client.set_connect_state()
+        if resume is not None:
+            client.set_session(resume.get_session())
 
         for _ in range(20):
             try:
@@ -254,6 +257,17 @@ class PeapPhaseTwo(unittest.TestCase):
         client.bio_write(session.tls_out)
         inner = client.recv(65535)
         # PEAPv0 strips the 4-byte EAP header: type byte then payload.
+        self.assertEqual(inner[0], cr.EAP_IDENTITY)
+
+    def test_resumed_handshake_starts_phase_two_without_an_ack(self):
+        """On resumption the client's Finished comes last and no ACK
+        follows, so phase 2 must start straight away."""
+        _, first = self.handshake()
+        session, client = self.handshake(resume=first)
+        # Same master secret = the session was resumed, not renegotiated.
+        self.assertEqual(client.master_key(), first.master_key())
+        self.assertEqual(session.phase, "identity")
+        inner = client.recv(65535)
         self.assertEqual(inner[0], cr.EAP_IDENTITY)
 
 

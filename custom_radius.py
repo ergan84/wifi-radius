@@ -635,6 +635,15 @@ class RadiusServer:
             except (SSL.WantReadError, SSL.WantWriteError):
                 pass
             self.tls_output(session)
+            if (session.phase == "start_phase2"
+                    and len(session.tls_out) <= session.tls_out_offset):
+                # Resumed (abbreviated) handshake: the client's Finished
+                # came last, so there is no server flight to flush and no
+                # PEAP ACK will follow - the client now waits for phase 2.
+                # Waiting for an ACK here deadlocks until the supplicant
+                # times out; Windows resumes on every re-authentication
+                # (roaming, reconnect), so laptops kept dropping off.
+                self.process_tls(session, b"")
             return
 
         if session.phase == "start_phase2":
